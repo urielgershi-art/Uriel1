@@ -1,0 +1,471 @@
+import { useState, useEffect, useCallback } from "react";
+
+const CLAUDE_API = "https://api.anthropic.com/v1/messages";
+
+// --- Helpers ---
+function genRoomId() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+async function callClaude(type, name) {
+  const prompt =
+    type === "truth"
+      ? `Generate a fun, creative, slightly challenging "Truth" question for a Truth or Dare game. The question is for a player named ${name}. Return ONLY the question in Hebrew, nothing else, no quotes, no explanation. Make it personal and interesting.`
+      : `Generate a fun, creative, slightly daring "Dare" challenge for a Truth or Dare game. The dare is for a player named ${name}. Return ONLY the dare in Hebrew, nothing else, no quotes, no explanation. Make it doable but fun and a bit embarrassing.`;
+
+  const res = await fetch(CLAUDE_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text?.trim() || "שגיאה, נסה שנית";
+}
+
+// --- Storage keys ---
+const roomKey = (id) => `tod-room-${id}`;
+
+async function getRoom(id) {
+  try {
+    const r = await window.storage.get(roomKey(id), true);
+    return r ? JSON.parse(r.value) : null;
+  } catch { return null; }
+}
+
+async function setRoom(id, data) {
+  await window.storage.set(roomKey(id), JSON.stringify(data), true);
+}
+
+// --- Main App ---
+export default function App() {
+  const [screen, setScreen] = useState("home"); // home | create | join | lobby | game | result
+  const [myName, setMyName] = useState("");
+  const [roomId, setRoomId] = useState("");
+  const [joinInput, setJoinInput] = useState("");
+  const [role, setRole] = useState(""); // host | guest
+  const [room, setRoom] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [pollTimer, setPollTimer] = useState(null);
+
+  const playerId = role === "host" ? "host" : "guest";
+  const opponentId = role === "host" ? "guest" : "host";
+
+  // Poll for room updates
+  const startPolling = useCallback((id) => {
+    const t = setInterval(async () => {
+      const r = await getRoom(id);
+      if (r) setRoom(r);
+    }, 1500);
+    setPollTimer(t);
+    return t;
+  }, []);
+
+  useEffect(() => {
+    return () => { if (pollTimer) clearInterval(pollTimer); };
+  }, [pollTimer]);
+
+  // Derive screen from room state
+  useEffect(() => {
+    if (!room) return;
+    if (room.phase === "lobby") setScreen("lobby");
+    else if (room.phase === "pick" || room.phase === "waiting") setScreen("game");
+    else if (room.phase === "reveal") setScreen("result");
+  }, [room]);
+
+  // --- Actions ---
+  async function createRoom() {
+    if (!myName.trim()) return setError("הכנס שם");
+    setLoading(true);
+    const id = genRoomId();
+    const newRoom = {
+      id,
+      phase: "lobby",
+      host: { name: myName.trim(), choice: null, content: null },
+      guest: { name: null, choice: null, content: null },
+      turn: "host",
+      round: 1,
+    };
+    await setRoom(id, newRoom);
+    setRoomId(id);
+    setRole("host");
+    setRoom(newRoom);
+    setScreen("lobby");
+    startPolling(id);
+    setLoading(false);
+  }
+
+  async function joinRoom() {
+    if (!myName.trim()) return setError("הכנס שם");
+    if (!joinInput.trim()) return setError("הכנס קוד חדר");
+    setLoading(true);
+    const id = joinInput.trim().toUpperCase();
+    const r = await getRoom(id);
+    if (!r) { setLoading(false); return setError("חדר לא נמצא"); }
+    if (r.guest?.name) { setLoading(false); return setError("החדר מלא"); }
+    r.guest = { name: myName.trim(), choice: null, content: null };
+    r.phase = "pick";
+    await setRoom(id, r);
+    setRoomId(id);
+    setRole("guest");
+    setRoom(r);
+    setScreen("game");
+    startPolling(id);
+    setLoading(false);
+  }
+
+  async function makeChoice(type) {
+    setLoading(true);
+    const r = await getRoom(roomId);
+    const me = r[playerId];
+    me.choice = type;
+    me.content = "...";
+    await setRoom(roomId, r);
+    setRoom(r);
+
+    // Generate content
+    const content = await callClaude(type, me.name);
+    const r2 = await getRoom(roomId);
+    r2[playerId].content = content;
+
+    // Check if both picked
+    const other = r2[opponentId];
+    if (other.choice && other.content && other.content !== "...") {
+      r2.phase = "reveal";
+    } else {
+      r2.phase = "waiting";
+    }
+    await setRoom(roomId, r2);
+    setRoom(r2);
+    setLoading(false);
+  }
+
+  async function nextRound() {
+    setLoading(true);
+    const r = await getRoom(roomId);
+    r.phase = "pick";
+    r.round = (r.round || 1) + 1;
+    r.host.choice = null; r.host.content = null;
+    r.guest.choice = null; r.guest.content = null;
+    await setRoom(roomId, r);
+    setRoom(r);
+    setLoading(false);
+  }
+
+  // --- UI ---
+  const myData = room?.[playerId];
+  const oppData = room?.[opponentId];
+  const iMadeChoice = !!myData?.choice;
+  const bothMade = iMadeChoice && !!oppData?.choice && oppData?.content && oppData?.content !== "...";
+
+  return (
+    <div style={styles.root}>
+      <div style={styles.bg} />
+      <div style={styles.noise} />
+
+      {screen === "home" && (
+        <HomeScreen
+          myName={myName} setMyName={setMyName}
+          joinInput={joinInput} setJoinInput={setJoinInput}
+          onCreate={createRoom} onJoin={joinRoom}
+          loading={loading} error={error} setError={setError}
+        />
+      )}
+
+      {screen === "lobby" && (
+        <LobbyScreen roomId={roomId} myName={myName} waiting={!room?.guest?.name} />
+      )}
+
+      {screen === "game" && room && (
+        <GameScreen
+          myData={myData} oppData={oppData}
+          iMadeChoice={iMadeChoice} bothMade={bothMade}
+          onChoice={makeChoice} loading={loading}
+          round={room.round}
+        />
+      )}
+
+      {screen === "result" && room && (
+        <ResultScreen
+          myData={myData} oppData={oppData}
+          myRole={role} onNext={nextRound} loading={loading}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---- Screens ----
+
+function HomeScreen({ myName, setMyName, joinInput, setJoinInput, onCreate, onJoin, loading, error, setError }) {
+  return (
+    <div style={styles.center}>
+      <div style={styles.card}>
+        <div style={styles.logo}>🔥</div>
+        <h1 style={styles.title}>אמת או חובה</h1>
+        <p style={styles.sub}>משחק מולטיפלייר עם חברים</p>
+
+        {error && <div style={styles.errorBox}>{error}</div>}
+
+        <input
+          style={styles.input}
+          placeholder="השם שלך"
+          value={myName}
+          onChange={e => { setMyName(e.target.value); setError(""); }}
+          dir="rtl"
+        />
+
+        <button style={{ ...styles.btn, ...styles.btnFire }} onClick={onCreate} disabled={loading}>
+          {loading ? "⏳" : "🎮 צור משחק חדש"}
+        </button>
+
+        <div style={styles.divider}><span>או הצטרף</span></div>
+
+        <input
+          style={styles.input}
+          placeholder="קוד חדר"
+          value={joinInput}
+          onChange={e => { setJoinInput(e.target.value.toUpperCase()); setError(""); }}
+          maxLength={6}
+          dir="ltr"
+        />
+        <button style={{ ...styles.btn, ...styles.btnIce }} onClick={onJoin} disabled={loading}>
+          {loading ? "⏳" : "🚀 הצטרף למשחק"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LobbyScreen({ roomId, myName, waiting }) {
+  const [copied, setCopied] = useState(false);
+  function copy() {
+    navigator.clipboard?.writeText(roomId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+  return (
+    <div style={styles.center}>
+      <div style={styles.card}>
+        <div style={styles.logo}>⏳</div>
+        <h2 style={styles.title}>היי {myName}!</h2>
+        <p style={styles.sub}>שלח את קוד החדר לחבר שלך</p>
+        <div style={styles.roomCode} onClick={copy}>
+          {roomId}
+          <span style={styles.copyHint}>{copied ? "✅ הועתק!" : "לחץ להעתקה"}</span>
+        </div>
+        {waiting
+          ? <p style={styles.waitText}>⌛ ממתין לחבר שיצטרף...</p>
+          : <p style={styles.waitText}>✅ החבר הצטרף! מתחילים...</p>
+        }
+        <div style={styles.spinner} />
+      </div>
+    </div>
+  );
+}
+
+function GameScreen({ myData, oppData, iMadeChoice, bothMade, onChoice, loading, round }) {
+  return (
+    <div style={styles.center}>
+      <div style={styles.card}>
+        <div style={styles.roundBadge}>סיבוב {round}</div>
+        <h2 style={styles.title}>בחר את גורלך 👇</h2>
+
+        <div style={styles.playerInfo}>
+          <span style={styles.playerName}>👤 {myData?.name}</span>
+        </div>
+
+        {!iMadeChoice ? (
+          <div style={styles.choiceRow}>
+            <button style={{ ...styles.choiceBtn, ...styles.truthBtn }} onClick={() => onChoice("truth")} disabled={loading}>
+              <span style={styles.choiceIcon}>🤔</span>
+              <span>אמת</span>
+            </button>
+            <button style={{ ...styles.choiceBtn, ...styles.dareBtn }} onClick={() => onChoice("dare")} disabled={loading}>
+              <span style={styles.choiceIcon}>🔥</span>
+              <span>חובה</span>
+            </button>
+          </div>
+        ) : (
+          <div style={styles.waitBox}>
+            <p style={styles.pickedText}>
+              בחרת: <strong>{myData?.choice === "truth" ? "🤔 אמת" : "🔥 חובה"}</strong>
+            </p>
+            {!bothMade
+              ? <p style={styles.waitText}>⌛ ממתין ל-{oppData?.name}...</p>
+              : <p style={styles.waitText}>✅ שניכם בחרתם! טוען תוצאות...</p>
+            }
+            {loading && <div style={styles.spinner} />}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResultScreen({ myData, oppData, myRole, onNext, loading }) {
+  const typeLabel = (t) => t === "truth" ? "🤔 אמת" : "🔥 חובה";
+
+  return (
+    <div style={styles.center}>
+      <div style={styles.card}>
+        <h2 style={styles.title}>🎉 התוצאות</h2>
+
+        <ResultCard player={myData} label="אתה" />
+        <div style={styles.vs}>VS</div>
+        <ResultCard player={oppData} label={oppData?.name} />
+
+        {myRole === "host" && (
+          <button style={{ ...styles.btn, ...styles.btnFire, marginTop: 24 }} onClick={onNext} disabled={loading}>
+            {loading ? "⏳" : "➡️ סיבוב הבא"}
+          </button>
+        )}
+        {myRole === "guest" && (
+          <p style={styles.waitText}>⌛ ממתין למארח להתחיל סיבוב הבא...</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResultCard({ player, label }) {
+  if (!player) return null;
+  const isT = player.choice === "truth";
+  return (
+    <div style={{ ...styles.resultCard, borderColor: isT ? "#38bdf8" : "#f97316" }}>
+      <div style={styles.resultHeader}>
+        <span style={styles.resultName}>{label}</span>
+        <span style={{ ...styles.badge, background: isT ? "#0ea5e9" : "#ea580c" }}>
+          {isT ? "🤔 אמת" : "🔥 חובה"}
+        </span>
+      </div>
+      <p style={styles.resultContent} dir="rtl">{player.content || "..."}</p>
+    </div>
+  );
+}
+
+// ---- Styles ----
+const styles = {
+  root: {
+    minHeight: "100vh",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontFamily: "'Segoe UI', Tahoma, sans-serif",
+    position: "relative",
+    overflow: "hidden",
+    background: "#0f0c1a",
+    direction: "rtl",
+  },
+  bg: {
+    position: "fixed", inset: 0, zIndex: 0,
+    background: "radial-gradient(ellipse at 20% 50%, #1e1040 0%, transparent 60%), radial-gradient(ellipse at 80% 20%, #2d0e2a 0%, transparent 60%), radial-gradient(ellipse at 50% 90%, #0c1a3a 0%, transparent 60%)",
+  },
+  noise: {
+    position: "fixed", inset: 0, zIndex: 1, opacity: 0.04,
+    backgroundImage: "url(\"data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")",
+  },
+  center: {
+    position: "relative", zIndex: 2,
+    display: "flex", alignItems: "center", justifyContent: "center",
+    width: "100%", minHeight: "100vh", padding: 16,
+  },
+  card: {
+    background: "rgba(255,255,255,0.05)",
+    backdropFilter: "blur(20px)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 24,
+    padding: "36px 28px",
+    maxWidth: 420,
+    width: "100%",
+    boxShadow: "0 8px 64px rgba(0,0,0,0.5)",
+    textAlign: "center",
+  },
+  logo: { fontSize: 64, marginBottom: 8 },
+  title: { color: "#fff", fontSize: 28, fontWeight: 800, margin: "0 0 6px" },
+  sub: { color: "rgba(255,255,255,0.5)", fontSize: 14, marginBottom: 24 },
+  input: {
+    width: "100%", boxSizing: "border-box",
+    padding: "12px 16px", borderRadius: 12,
+    background: "rgba(255,255,255,0.07)",
+    border: "1px solid rgba(255,255,255,0.15)",
+    color: "#fff", fontSize: 16, outline: "none",
+    marginBottom: 12, textAlign: "right",
+  },
+  btn: {
+    width: "100%", padding: "13px 0", borderRadius: 12,
+    border: "none", fontSize: 16, fontWeight: 700,
+    cursor: "pointer", transition: "transform .15s",
+    marginBottom: 10,
+  },
+  btnFire: { background: "linear-gradient(135deg,#f97316,#dc2626)", color: "#fff" },
+  btnIce: { background: "linear-gradient(135deg,#38bdf8,#6366f1)", color: "#fff" },
+  divider: {
+    color: "rgba(255,255,255,0.3)", fontSize: 13,
+    display: "flex", alignItems: "center", gap: 8,
+    margin: "8px 0 16px",
+  },
+  errorBox: {
+    background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)",
+    borderRadius: 10, padding: "10px 14px", color: "#fca5a5",
+    fontSize: 14, marginBottom: 14,
+  },
+  roomCode: {
+    background: "rgba(255,255,255,0.07)", border: "2px dashed rgba(255,255,255,0.2)",
+    borderRadius: 14, padding: "18px 0", fontSize: 42, fontWeight: 900,
+    color: "#fff", letterSpacing: 8, cursor: "pointer",
+    marginBottom: 10, userSelect: "all",
+  },
+  copyHint: { display: "block", fontSize: 12, color: "rgba(255,255,255,0.4)", letterSpacing: 0, marginTop: 4, fontWeight: 400 },
+  waitText: { color: "rgba(255,255,255,0.5)", fontSize: 15 },
+  spinner: {
+    width: 32, height: 32, borderRadius: "50%",
+    border: "3px solid rgba(255,255,255,0.1)",
+    borderTopColor: "#f97316",
+    animation: "spin 0.8s linear infinite",
+    margin: "16px auto 0",
+  },
+  roundBadge: {
+    display: "inline-block", background: "rgba(249,115,22,0.2)",
+    border: "1px solid #f97316", borderRadius: 20,
+    padding: "4px 14px", color: "#fb923c", fontSize: 13,
+    fontWeight: 700, marginBottom: 12,
+  },
+  playerInfo: { marginBottom: 20 },
+  playerName: { color: "rgba(255,255,255,0.6)", fontSize: 15 },
+  choiceRow: { display: "flex", gap: 14 },
+  choiceBtn: {
+    flex: 1, padding: "20px 0", borderRadius: 16,
+    border: "2px solid transparent", fontSize: 18,
+    fontWeight: 800, cursor: "pointer",
+    display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+    transition: "transform .15s, box-shadow .15s",
+  },
+  truthBtn: { background: "linear-gradient(135deg,#0ea5e9,#6366f1)", color: "#fff" },
+  dareBtn: { background: "linear-gradient(135deg,#f97316,#dc2626)", color: "#fff" },
+  choiceIcon: { fontSize: 36 },
+  waitBox: { background: "rgba(255,255,255,0.04)", borderRadius: 14, padding: 20 },
+  pickedText: { color: "#fff", fontSize: 16, marginBottom: 8 },
+  vs: {
+    color: "rgba(255,255,255,0.3)", fontWeight: 900, fontSize: 20,
+    margin: "10px 0",
+  },
+  resultCard: {
+    background: "rgba(255,255,255,0.05)", borderRadius: 16,
+    border: "2px solid", padding: "16px 18px",
+    textAlign: "right", marginBottom: 10,
+  },
+  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
+  resultName: { color: "#fff", fontWeight: 700, fontSize: 16 },
+  badge: { borderRadius: 20, padding: "3px 12px", fontSize: 13, fontWeight: 700, color: "#fff" },
+  resultContent: { color: "rgba(255,255,255,0.8)", fontSize: 15, margin: 0, lineHeight: 1.6 },
+};
+
+// inject keyframe
+const styleTag = document.createElement("style");
+styleTag.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;
+document.head.appendChild(styleTag);
